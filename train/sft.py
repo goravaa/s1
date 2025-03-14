@@ -8,6 +8,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 from datasets import load_dataset, concatenate_datasets, DatasetDict
 import transformers
 import trl
+import torch
+from transformers import BitsAndBytesConfig
 
 @dataclass
 class TrainingConfig:
@@ -17,47 +19,78 @@ class TrainingConfig:
     wandb_entity: Optional[str] = field(default="hashimoto-group")
     train_file_path: Optional[str] = field(default='simplescaling/s1K_tokenized')
     dagger: bool = field(default=False)
+    lora: bool = field(default=True)  # Enable LoRA by default
+    quantization: Optional[str] = field(default=None)  # Options: None, "8bit", "4bit"
 
     def __post_init__(self):
         os.environ['WANDB_PROJECT'] = self.wandb_project
         os.environ['WANDB_ENTITY'] = self.wandb_entity
 
 def train():
-    # parsing input
+    # Parsing input arguments
     parser = transformers.HfArgumentParser((TrainingConfig, trl.SFTConfig))
     config, args = parser.parse_args_into_dataclasses()
     log_config = {**asdict(config), **asdict(args)}
     logging.info(f"Training config: {log_config}")
 
-    # loading model
-    kwargs = {}
-    if "70B" in config.model_name:
-        # Removed "low_cpu_mem_usage": True, for 70B, since by default we are in FSDP,
-        # it's more efficient to do  "cpu_ram_efficient_loading": true, in fsdp_config.json
-        kwargs = {"device_map": "auto", "torch_dtype": "auto",
-                  "attn_implementation": "flash_attention_2", "use_cache": False}
-        model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name, **kwargs)
-    else:
-        model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name)
+    # Set up model loading kwargs with torch_dtype set to float16
+    load_kwargs = {
+        "device_map": "auto",
+        "torch_dtype": torch.float16,
+    }
+    
+    # Apply quantization if specified
+    if config.quantization == "8bit":
+        load_kwargs["load_in_8bit"] = True
+    elif config.quantization == "4bit":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_quant_type="nf4"  # Alternatively "fp4" if preferred
+        )
+        load_kwargs["quantization_config"] = bnb_config
 
+    # For 70B models, update additional kwargs
+    if "70B" in config.model_name:
+        load_kwargs.update({
+            "attn_implementation": "flash_attention_2",
+            "use_cache": False
+        })
+        
+    # Load model with updated configurations
+    model = transformers.AutoModelForCausalLM.from_pretrained(config.model_name, **load_kwargs)
+    
+    # Apply LoRA if enabled
+    if config.lora:
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError:
+            raise ImportError("Please install peft to use LoRA: pip install peft")
+        
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=32,
+            target_modules=["q_proj", "v_proj"],  # Adjust based on the model architecture
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        model = get_peft_model(model, lora_config)
+    
     dataset = load_dataset(config.train_file_path)
 
-    # setting up trainer
+    # Set up tokenizer and templates
     tokenizer = transformers.AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
     if "Llama" in config.model_name:
         instruction_template = "<|start_header_id|>user<|end_header_id|>"
         response_template = "<|start_header_id|>assistant<|end_header_id|>\n\n"
-        # Use a token that is never used
-        tokenizer.pad_token = "<|reserved_special_token_5|>"
+        tokenizer.pad_token = "<|reserved_special_token_5|>"  # Unused token for padding
     elif "Qwen" in config.model_name:
         instruction_template = "<|im_start|>user"
         response_template = "<|im_start|>assistant\n"
-        # Use a token that is never used
         tokenizer.pad_token = "<|fim_pad|>"
 
-    # Only compute loss over assistant responses
-    # Verified that it precisely starts where the thinking tokens start and ends with the first pad token
-    # via labels being set to -100
+    # Data collator for training: only compute loss over assistant responses
     collator = trl.DataCollatorForCompletionOnlyLM(
         instruction_template=instruction_template,
         response_template=response_template,
@@ -78,7 +111,6 @@ def train():
     trainer.save_model(output_dir=args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     trainer.accelerator.wait_for_everyone()
-
 
 if __name__ == "__main__":
     train()
